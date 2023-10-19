@@ -42,6 +42,23 @@ def BeforeUpload(target, source, env):
         env.Replace(UPLOAD_PORT=env.WaitForNewSerialPort(before_ports))
 
 
+def _get_board_memory_type(env):
+    board_config = env.BoardConfig()
+    default_type = "%s_%s" % (
+        board_config.get("build.flash_mode", "dio"),
+        board_config.get("build.psram_type", "qspi"),
+    )
+
+    return board_config.get(
+        "build.memory_type",
+        board_config.get(
+            "build.%s.memory_type"
+            % env.subst("$PIOFRAMEWORK").strip().replace(" ", "_"),
+            default_type,
+        ),
+    )
+
+
 def _get_board_f_flash(env):
     frequency = env.subst("$BOARD_F_FLASH")
     frequency = str(frequency).replace("L", "")
@@ -49,17 +66,24 @@ def _get_board_f_flash(env):
 
 
 def _get_board_flash_mode(env):
-    memory_type = env.BoardConfig().get("build.arduino.memory_type", "qio_qspi")
-    mode = env.subst("$BOARD_FLASH_MODE")
-    if memory_type in ("opi_opi", "opi_qspi"):
+    if ["arduino"] == env.get("PIOFRAMEWORK") and _get_board_memory_type(env) in (
+        "opi_opi",
+        "opi_qspi",
+    ):
         return "dout"
+
+    mode = env.subst("$BOARD_FLASH_MODE")
     if mode in ("qio", "qout"):
         return "dio"
     return mode
 
 
 def _get_board_boot_mode(env):
-    return env.BoardConfig().get("build.boot", "$BOARD_FLASH_MODE")
+    memory_type = env.BoardConfig().get("build.arduino.memory_type", "")
+    build_boot = env.BoardConfig().get("build.boot", "$BOARD_FLASH_MODE")
+    if ["arduino"] == env.get("PIOFRAMEWORK") and memory_type in ("opi_opi", "opi_qspi"):
+        build_boot = "opi"
+    return build_boot
 
 
 def _parse_size(value):
@@ -84,7 +108,9 @@ def _parse_partitions(env):
         return
 
     result = []
-    next_offset = 0
+    # The first offset is 0x9000 because partition table is flashed to 0x8000 and
+    # occupies an entire flash sector, which size is 0x1000
+    next_offset = 0x9000
     with open(partitions_csv) as fp:
         for line in fp.readlines():
             line = line.strip()
@@ -93,11 +119,14 @@ def _parse_partitions(env):
             tokens = [t.strip() for t in line.split(",")]
             if len(tokens) < 5:
                 continue
+
+            bound = 0x10000 if tokens[1] in ("0", "app") else 4
+            calculated_offset = (next_offset + bound - 1) & ~(bound - 1)
             partition = {
                 "name": tokens[0],
                 "type": tokens[1],
                 "subtype": tokens[2],
-                "offset": tokens[3] or next_offset,
+                "offset": tokens[3] or calculated_offset,
                 "size": tokens[4],
                 "flags": tokens[5] if len(tokens) > 5 else None
             }
@@ -106,21 +135,41 @@ def _parse_partitions(env):
                 partition["size"]
             )
 
-            bound = 0x10000 if partition["type"] in ("0", "app") else 4
-            next_offset = (next_offset + bound - 1) & ~(bound - 1)
-
     return result
 
 
 def _update_max_upload_size(env):
     if not env.get("PARTITIONS_TABLE_CSV"):
         return
-    sizes = [
-        _parse_size(p["size"]) for p in _parse_partitions(env)
+    sizes = {
+        p["subtype"]: _parse_size(p["size"]) for p in _parse_partitions(env)
         if p["type"] in ("0", "app")
-    ]
-    if sizes:
-        board.update("upload.maximum_size", max(sizes))
+    }
+
+    partitions = {p["name"]: p for p in _parse_partitions(env)}
+
+    # User-specified partition name has the highest priority
+    custom_app_partition_name = board.get("build.app_partition_name", "")
+    if custom_app_partition_name:
+        selected_partition = partitions.get(custom_app_partition_name, {})
+        if selected_partition:
+            board.update("upload.maximum_size", _parse_size(selected_partition["size"]))
+            return
+        else:
+            print(
+                "Warning! Selected partition `%s` is not available in the partition " \
+                "table! Default partition will be used!" % custom_app_partition_name
+            )
+
+    # Otherwise, one of the `factory` or `ota_0` partitions is used to determine
+    # available memory size. If both partitions are set, we should prefer the `factory`,
+    # but there are cases (e.g. Adafruit's `partitions-4MB-tinyuf2.csv`) that uses the
+    # `factory` partition for their UF2 bootloader. So let's use the first match
+    # https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/partition-tables.html#subtype
+    for p in partitions.values():
+        if p["type"] in ("0", "app") and p["subtype"] in ("factory", "ota_0"):
+            board.update("upload.maximum_size", _parse_size(p["size"]))
+            break
 
 
 def _to_unix_slashes(path):
@@ -167,7 +216,7 @@ board = env.BoardConfig()
 mcu = board.get("build.mcu", "esp32")
 toolchain_arch = "xtensa-%s" % mcu
 filesystem = board.get("build.filesystem", "spiffs")
-if mcu == "esp32c3":
+if mcu in ("esp32c3", "esp32c6"):
     toolchain_arch = "riscv32-esp"
 
 if "INTEGRATION_EXTRA_DATA" not in env:
@@ -177,12 +226,22 @@ env.Replace(
     __get_board_boot_mode=_get_board_boot_mode,
     __get_board_f_flash=_get_board_f_flash,
     __get_board_flash_mode=_get_board_flash_mode,
+    __get_board_memory_type=_get_board_memory_type,
 
     AR="%s-elf-ar" % toolchain_arch,
     AS="%s-elf-as" % toolchain_arch,
     CC="%s-elf-gcc" % toolchain_arch,
     CXX="%s-elf-g++" % toolchain_arch,
-    GDB="%s-elf-gdb" % toolchain_arch,
+    GDB=join(
+        platform.get_package_dir(
+            "tool-riscv32-esp-elf-gdb"
+            if mcu in ("esp32c3", "esp32c6")
+            else "tool-xtensa-esp-elf-gdb"
+        )
+        or "",
+        "bin",
+        "%s-elf-gdb" % toolchain_arch,
+    ) if env.get("PIOFRAMEWORK") == ["espidf"] else "%s-elf-gdb" % toolchain_arch,
     OBJCOPY=join(
         platform.get_package_dir("tool-esptoolpy") or "", "esptool.py"),
     RANLIB="%s-elf-ranlib" % toolchain_arch,
@@ -234,11 +293,11 @@ env.Append(
     BUILDERS=dict(
         ElfToBin=Builder(
             action=env.VerboseAction(" ".join([
-                '"$PYTHONEXE" "$OBJCOPY"',
+                        '"$PYTHONEXE" "$OBJCOPY"',
                 "--chip", mcu, "elf2image",
-                "--flash_mode", "$BOARD_FLASH_MODE",
+                "--flash_mode", "${__get_board_flash_mode(__env__)}",
                 "--flash_freq", "${__get_board_f_flash(__env__)}",
-                "--flash_size", board.get("upload.flash_size", "detect"),
+                "--flash_size", board.get("upload.flash_size", "4MB"),
                 "-o", "$TARGET", "$SOURCES"
             ]), "Building $TARGET"),
             suffix=".bin"
@@ -387,11 +446,12 @@ elif upload_protocol == "esptool":
                 "--chip", mcu,
                 "--port", '"$UPLOAD_PORT"',
                 "--baud", "$UPLOAD_SPEED",
-                "--before", "default_reset",
-                "--after", "hard_reset",
+                "--before", board.get("upload.before_reset", "default_reset"),
+                "--after", board.get("upload.after_reset", "hard_reset"),
                 "write_flash", "-z",
-                "--flash_mode", "$BOARD_FLASH_MODE",
-                "--flash_size", "detect",
+                "--flash_mode", "${__get_board_flash_mode(__env__)}",
+                "--flash_freq", "${__get_board_f_flash(__env__)}",
+                "--flash_size", board.get("upload.flash_size", "detect"),
                 "$FS_START"
             ],
             UPLOADCMD='"$PYTHONEXE" "$UPLOADER" $UPLOADERFLAGS $SOURCE',
@@ -429,6 +489,27 @@ elif upload_protocol == "mbctool":
         env.VerboseAction("$UPLOADCMD", "Uploading $SOURCE")
     ]
 
+elif upload_protocol == "dfu":
+
+    hwids = board.get("build.hwids", [["0x2341", "0x0070"]])
+    vid = hwids[0][0]
+    pid = hwids[0][1]
+
+    upload_actions = [env.VerboseAction("$UPLOADCMD", "Uploading $SOURCE")]
+
+    env.Replace(
+        UPLOADER=join(
+            platform.get_package_dir("tool-dfuutil-arduino") or "", "dfu-util"
+        ),
+        UPLOADERFLAGS=[
+            "-d",
+            ",".join(["%s:%s" % (hwid[0], hwid[1]) for hwid in hwids]),
+            "-Q",
+            "-D"
+        ],
+        UPLOADCMD='"$UPLOADER" $UPLOADERFLAGS "$SOURCE"',
+    )
+
 
 elif upload_protocol in debug_tools:
     openocd_args = ["-d%d" % (2 if int(ARGUMENTS.get("PIOVERBOSE", 0)) else 1)]
@@ -437,7 +518,7 @@ elif upload_protocol in debug_tools:
     openocd_args.extend(
         [
             "-c",
-            "adapter_khz %s" % env.GetProjectOption("debug_speed", "5000"),
+            "adapter speed %s" % env.GetProjectOption("debug_speed", "5000"),
             "-c",
             "program_esp {{$SOURCE}} %s verify"
             % (
@@ -506,6 +587,12 @@ env.AddPlatformTarget(
 if any("-Wl,-T" in f for f in env.get("LINKFLAGS", [])):
     print("Warning! '-Wl,-T' option for specifying linker scripts is deprecated. "
           "Please use 'board_build.ldscript' option in your 'platformio.ini' file.")
+
+#
+# Override memory inspection behavior
+#
+
+env.SConscript("sizedata.py", exports="env")
 
 #
 # Default targets
